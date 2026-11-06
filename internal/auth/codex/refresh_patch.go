@@ -314,5 +314,7 @@ func (p *CredentialRefreshPatch) Apply(disk map[string]any) map[string]any {
 			merged["siwc"] = mergedSIWC
 		}
 	}
+	RecordRefreshOutcomeUnknown(merged, p.outerErr)
+	RecordRefreshOutcomeUnknown(merged, p.siwcErr)
 	return merged
 }

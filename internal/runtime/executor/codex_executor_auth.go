@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -237,6 +238,7 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 		if diskUse, hasDiskUse := diskMap["use_siwc"]; hasDiskUse {
 			auth.Metadata["use_siwc"] = diskUse
 		}
+		codexauth.MergeRefreshOutcomes(auth.Metadata, diskMap)
 	}
 
 	var outerRefreshToken string
@@ -306,11 +308,24 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 		}
 		needSIWC = false
 	}
+	var outerErr error
+	if !homeEnabled {
+		// Home owns outer-grant reconciliation against its authoritative state.
+		outerErr = codexauth.RefreshOutcomeUnknown(auth.Metadata, false)
+	}
+	siwcErr := codexauth.RefreshOutcomeUnknown(auth.Metadata, true)
+	if outerErr != nil {
+		needOuter = false
+	}
+	if siwcErr != nil {
+		needSIWC = false
+	}
 
 	if !needOuter && !needSIWC {
 		if diskRotatedOuter || diskRotatedSIWC {
 			patch := codexauth.NewCredentialRefreshPatchWithDiskBaseline(beforeRefresh.Metadata, diskBaseline, auth.Metadata, diskRotatedOuter, diskRotatedSIWC)
 			patch.SetUpstreamRefreshed(false)
+			patch.SetPartitionErrors(outerErr, siwcErr)
 			auth.CodexRefreshPatch = patch
 			if storage, ok := auth.Storage.(*codexauth.CodexTokenStorage); ok && storage != nil {
 				clonedStorage := *storage
@@ -325,15 +340,16 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 			}
 			return nil, statusErr{code: http.StatusUnauthorized, msg: "codex executor: refresh token is invalid; sign-in required"}
 		}
+		if errOutcome := codexauth.NewPartitionRefreshError(outerErr, siwcErr); errOutcome != nil {
+			return auth, errOutcome
+		}
 		return auth, nil
 	}
 
 	svc := codexauth.NewCodexAuthWithProxyURL(cfg, auth.ProxyURL)
 
 	outerRefreshed := false
-	var outerErr error
 	siwcRefreshed := false
-	var siwcErr error
 
 	// Execute refreshes sequentially so outer and SIWC never race on the same credential state.
 	if needOuter {
@@ -460,22 +476,25 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 		auth.Storage = &clonedStorage
 	}
 
-	if !outerRefreshed && !siwcRefreshed && !diskRotatedOuter && !diskRotatedSIWC {
+	anyRefreshed := outerRefreshed || siwcRefreshed || diskRotatedOuter || diskRotatedSIWC
+	if !anyRefreshed && !codexauth.IsRefreshOutcomeUnknown(outerErr) && !codexauth.IsRefreshOutcomeUnknown(siwcErr) {
 		if errCombined := codexauth.NewPartitionRefreshError(outerErr, siwcErr); errCombined != nil {
 			return nil, errCombined
 		}
 		return nil, fmt.Errorf("codex executor: refresh failed")
 	}
-	if outerErr != nil {
+	if outerErr != nil && anyRefreshed {
 		log.Warnf("codex executor: SIWC token refreshed but outer token refresh failed for %s: %v", auth.ID, outerErr)
 	}
-	if siwcErr != nil {
+	if siwcErr != nil && anyRefreshed {
 		log.Warnf("codex executor: outer token refreshed but SIWC token refresh failed for %s: %v", auth.ID, siwcErr)
 	}
 
 	patch := codexauth.NewCredentialRefreshPatchWithDiskBaseline(beforeRefresh.Metadata, diskBaseline, auth.Metadata, outerRefreshed || diskRotatedOuter, siwcRefreshed || diskRotatedSIWC)
 	patch.SetUpstreamRefreshed(outerRefreshed || siwcRefreshed)
 	patch.SetPartitionErrors(outerErr, siwcErr)
+	codexauth.RecordRefreshOutcomeUnknown(auth.Metadata, outerErr)
+	codexauth.RecordRefreshOutcomeUnknown(auth.Metadata, siwcErr)
 	auth.CodexRefreshPatch = patch
 	if storage, ok := auth.Storage.(*codexauth.CodexTokenStorage); ok && storage != nil {
 		clonedStorage := *storage
@@ -485,17 +504,20 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 	if diskPath != "" {
 		latestBytes, errReadLatest := os.ReadFile(diskPath)
 		if errReadLatest != nil {
-			return auth, fmt.Errorf("codex executor: re-read credential file %s before write: %w", diskPath, errReadLatest)
+			return auth, errors.Join(fmt.Errorf("codex executor: re-read credential file %s before write: %w", diskPath, errReadLatest), codexauth.NewPartitionRefreshError(outerErr, siwcErr))
 		}
 		var latestDisk map[string]any
 		if errUnmarshal := json.Unmarshal(latestBytes, &latestDisk); errUnmarshal != nil || len(latestDisk) == 0 {
-			return auth, fmt.Errorf("codex executor: invalid credential JSON in %s before write: %w", diskPath, errUnmarshal)
+			return auth, errors.Join(fmt.Errorf("codex executor: invalid credential JSON in %s before write: %w", diskPath, errUnmarshal), codexauth.NewPartitionRefreshError(outerErr, siwcErr))
 		}
 		mergedDisk := patch.Apply(latestDisk)
 		if errWrite := codexauth.WriteJSONFileAtomic(diskPath, mergedDisk); errWrite != nil {
-			return auth, fmt.Errorf("codex executor: persist refreshed credentials to %s: %w", diskPath, errWrite)
+			return auth, errors.Join(fmt.Errorf("codex executor: persist refreshed credentials to %s: %w", diskPath, errWrite), codexauth.NewPartitionRefreshError(outerErr, siwcErr))
 		}
 		auth.Metadata = mergedDisk
+	}
+	if !anyRefreshed {
+		return auth, codexauth.NewPartitionRefreshError(outerErr, siwcErr)
 	}
 	return auth, nil
 }

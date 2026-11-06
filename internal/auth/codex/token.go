@@ -166,6 +166,7 @@ func MergeWithDiskMap(diskMap, incomingMap map[string]any) map[string]any {
 	if _, exists := diskMap["siwc"]; !exists && len(diskMap) > 0 {
 		delete(merged, "siwc")
 	}
+	MergeRefreshOutcomes(merged, diskMap)
 	return merged
 }
 
@@ -221,6 +222,7 @@ func MergeCodexCredentialsFromDisk(diskMap, incomingMetadata map[string]any) map
 			merged["use_siwc"] = value
 		}
 	}
+	MergeRefreshOutcomes(merged, diskMap)
 	return merged
 }
 

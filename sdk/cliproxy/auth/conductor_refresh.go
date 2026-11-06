@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	codexauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -1368,7 +1369,12 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	base := auth.Clone()
 	updated, err := exec.Refresh(ctx, base.Clone())
 	now := time.Now()
-	if err != nil && errors.Is(err, context.Canceled) {
+	if err != nil && codexauth.IsRefreshOutcomeUnknown(err) && base != nil && strings.EqualFold(base.Provider, "codex") {
+		if errPersist := m.persistCodexRefreshOutcome(ctx, base, err); errPersist != nil {
+			err = errors.Join(err, errPersist)
+		}
+	}
+	if err != nil && errors.Is(err, context.Canceled) && !codexauth.IsRefreshOutcomeUnknown(err) {
 		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
@@ -1420,6 +1426,12 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 				return nil, err
 			}
 			terminalRefresh := isTerminalRefreshError(current, err)
+			if strings.EqualFold(current.Provider, "codex") {
+				if current.Metadata == nil {
+					current.Metadata = make(map[string]any)
+				}
+				codexauth.RecordRefreshOutcomeUnknown(current.Metadata, err)
+			}
 			sanitizedRefreshErr := sanitizeRenewalError(current, err)
 			wasTerminalUnauthorized := hasUnauthorizedAuthFailure(current)
 			if wasTerminalUnauthorized {
