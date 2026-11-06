@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	codexauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
@@ -2232,8 +2233,18 @@ func isTransientTransportMessage(message string) bool {
 }
 
 func isUnauthorizedError(err error) bool {
+	err = knownRefreshErrors(err)
 	if err == nil {
 		return false
+	}
+	if codexauth.IsRefreshOutcomeUnknown(err) {
+		var partition interface {
+			OuterRefreshError() error
+			SIWCRefreshError() error
+		}
+		if errors.As(err, &partition) {
+			return isUnauthorizedError(partition.OuterRefreshError()) || isUnauthorizedError(partition.SIWCRefreshError())
+		}
 	}
 	if statusCodeFromError(err) == http.StatusUnauthorized {
 		return true
@@ -2365,6 +2376,7 @@ func isTerminalRefreshGrantMessage(message string) bool {
 }
 
 func isTerminalRefreshError(auth *Auth, err error) bool {
+	err = knownRefreshErrors(err)
 	if err == nil {
 		return false
 	}
@@ -2415,6 +2427,11 @@ func sanitizeRenewalError(auth *Auth, err error) *Error {
 	if err == nil {
 		return nil
 	}
+	if codexauth.IsRefreshOutcomeUnknown(err) && !isTerminalRefreshError(auth, err) {
+		var outcome *codexauth.RefreshOutcomeUnknownError
+		errors.As(err, &outcome)
+		return &Error{Code: ErrorCodeRefreshOutcomeUnknown, Message: outcome.Error(), HTTPStatus: http.StatusServiceUnavailable, Retryable: false}
+	}
 	var partErr interface {
 		OuterRefreshError() error
 		SIWCRefreshError() error
@@ -2454,6 +2471,9 @@ func sanitizeRenewalError(auth *Auth, err error) *Error {
 func refreshErrorFromError(err error) *Error {
 	if err == nil {
 		return nil
+	}
+	if codexauth.IsRefreshOutcomeUnknown(err) && !isTerminalRefreshError(nil, err) {
+		return sanitizeRenewalError(nil, err)
 	}
 	statusCode := statusCodeFromError(err)
 	if statusCode == 0 && isUnauthorizedError(err) {

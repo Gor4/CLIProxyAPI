@@ -3,10 +3,8 @@ package codex
 import (
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/MoeForge/moego/base64"
 	"io"
 	"net/http"
 	"net/url"
@@ -15,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/base64"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
 )
@@ -95,15 +94,14 @@ func (o *CodexAuth) GenerateSIWCAuthURL(state, nonce, deviceID, redirectURI stri
 	return fmt.Sprintf("%s?%s", SIWCAuthorizeURL, params.Encode()), nil
 }
 
-type siwcTokenResponse struct {
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	IDToken      string `json:"id_token"`
-	Scope        string `json:"scope"`
-	ExpiresIn    int    `json:"expires_in"`
-}
-
 func (o *CodexAuth) requestSIWCToken(ctx context.Context, form url.Values, clientID, deviceID string, requireIDToken bool) (*CodexSIWCTokenData, error) {
+	isRefresh := form.Get("grant_type") == "refresh_token"
+	outcomeError := func(stage string, cause error) error {
+		if isRefresh {
+			return NewRefreshOutcomeUnknownError(clientID, form.Get("refresh_token"), stage, cause)
+		}
+		return cause
+	}
 	req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, siwcTokenEndpointURL, strings.NewReader(form.Encode()))
 	if errReq != nil {
 		return nil, fmt.Errorf("failed to create SIWC token request: %w", errReq)
@@ -111,9 +109,17 @@ func (o *CodexAuth) requestSIWCToken(ctx context.Context, form url.Values, clien
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
-	resp, errDo := o.httpClient.Do(req)
+	doRequest := o.httpClient.Do
+	if isRefresh {
+		doRequest = func(req *http.Request) (*http.Response, error) { return doRefreshRequest(o.httpClient, req) }
+	}
+	resp, errDo := doRequest(req)
 	if errDo != nil {
-		return nil, fmt.Errorf("SIWC token request failed: %w", errDo)
+		errRequest := fmt.Errorf("SIWC token request failed: %w", errDo)
+		if refreshRequestNotSent(errDo) {
+			return nil, errRequest
+		}
+		return nil, outcomeError("transport", errRequest)
 	}
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
@@ -123,35 +129,39 @@ func (o *CodexAuth) requestSIWCToken(ctx context.Context, form url.Values, clien
 
 	body, errRead := io.ReadAll(resp.Body)
 	if errRead != nil {
-		return nil, fmt.Errorf("failed to read SIWC token response: %w", errRead)
+		return nil, outcomeError("response_read", fmt.Errorf("failed to read SIWC token response: %w", errRead))
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("OpenAI OAuth token request failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		errResponse := fmt.Errorf("OpenAI OAuth token request failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		if !isRefresh || isNonRetryableRefreshErr(errResponse) {
+			return nil, errResponse
+		}
+		return nil, outcomeError("response_status", fmt.Errorf("SIWC token refresh response status %d", resp.StatusCode))
 	}
 
-	var tokenResp siwcTokenResponse
-	if errUnmarshal := json.Unmarshal(body, &tokenResp); errUnmarshal != nil {
-		return nil, fmt.Errorf("failed to parse SIWC token response: %w", errUnmarshal)
+	tokenResp, errDecode := parseOAuthTokenResponse(body)
+	if errDecode != nil {
+		return nil, outcomeError("response_decode", fmt.Errorf("failed to parse SIWC token response: %w", errDecode))
 	}
 	if strings.TrimSpace(tokenResp.AccessToken) == "" {
-		return nil, fmt.Errorf("OpenAI OAuth token response has invalid access_token")
+		return nil, outcomeError("response_validate", fmt.Errorf("OpenAI OAuth token response has invalid access_token"))
 	}
 	if strings.TrimSpace(tokenResp.RefreshToken) == "" {
-		return nil, fmt.Errorf("OpenAI OAuth token response has invalid refresh_token")
+		return nil, outcomeError("response_validate", fmt.Errorf("OpenAI OAuth token response has invalid refresh_token"))
 	}
 	if requireIDToken && strings.TrimSpace(tokenResp.IDToken) == "" {
 		return nil, fmt.Errorf("OpenAI OAuth token response did not contain an ID token")
 	}
 	if strings.TrimSpace(tokenResp.Scope) == "" {
-		return nil, fmt.Errorf("OpenAI OAuth token response has invalid scope")
+		return nil, outcomeError("response_validate", fmt.Errorf("OpenAI OAuth token response has invalid scope"))
 	}
 	if tokenResp.ExpiresIn <= 0 {
-		return nil, fmt.Errorf("OpenAI OAuth token response has invalid expires_in")
+		return nil, outcomeError("response_validate", fmt.Errorf("OpenAI OAuth token response has invalid expires_in"))
 	}
 
 	scopes := strings.Fields(tokenResp.Scope)
 	if !slices.Contains(scopes, SIWCDirectTokenScope) {
-		return nil, fmt.Errorf("OpenAI OAuth grant did not include %s", SIWCDirectTokenScope)
+		return nil, outcomeError("response_validate", fmt.Errorf("OpenAI OAuth grant did not include %s", SIWCDirectTokenScope))
 	}
 
 	now := time.Now()
@@ -255,6 +265,9 @@ func (o *CodexAuth) RefreshSIWCTokens(ctx context.Context, refreshToken, clientI
 
 	sfKey := clientID + ":" + refreshToken
 	result, errSF, _ := siwcRefreshGroup.Do(sfKey, func() (any, error) {
+		if errOutcome := unresolvedRefreshOutcome(clientID, refreshToken); errOutcome != nil {
+			return nil, errOutcome
+		}
 		refreshCtx, cancelRefresh := context.WithTimeout(context.WithoutCancel(ctx), codexRefreshTimeout)
 		defer cancelRefresh()
 		form := url.Values{
@@ -263,7 +276,9 @@ func (o *CodexAuth) RefreshSIWCTokens(ctx context.Context, refreshToken, clientI
 			"refresh_token": {refreshToken},
 			"resource":      {SIWCResource},
 		}
-		return o.requestSIWCToken(refreshCtx, form, clientID, deviceID, false)
+		tokens, errRefresh := o.requestSIWCToken(refreshCtx, form, clientID, deviceID, false)
+		rememberRefreshOutcome(errRefresh)
+		return tokens, errRefresh
 	})
 	if errSF != nil {
 		return nil, WrapSIWCRefreshError(errSF)
@@ -275,8 +290,11 @@ func (o *CodexAuth) RefreshSIWCTokens(ctx context.Context, refreshToken, clientI
 	return tokenData, nil
 }
 
-// RefreshSIWCTokensWithRetry refreshes SIWC tokens with exponential backoff.
+// RefreshSIWCTokensWithRetry retries only failures known to precede submission.
 func (o *CodexAuth) RefreshSIWCTokensWithRetry(ctx context.Context, refreshToken, clientID, deviceID string, maxRetries int) (*CodexSIWCTokenData, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if maxRetries <= 0 {
 		maxRetries = 1
 	}
@@ -293,12 +311,12 @@ func (o *CodexAuth) RefreshSIWCTokensWithRetry(ctx context.Context, refreshToken
 		if errRefresh == nil {
 			return tokenData, nil
 		}
-		if isNonRetryableRefreshErr(errRefresh) {
-			log.Warnf("SIWC token refresh attempt %d failed with non-retryable error: %v", attempt+1, errRefresh)
+		if isNonRetryableRefreshErr(errRefresh) || !refreshRequestNotSent(errRefresh) {
+			log.Warnf("SIWC token refresh attempt %d stopped without replay", attempt+1)
 			return nil, errRefresh
 		}
 		lastErr = errRefresh
-		log.Warnf("SIWC token refresh attempt %d failed: %v", attempt+1, errRefresh)
+		log.Warnf("SIWC token refresh attempt %d failed before submission", attempt+1)
 	}
 	return nil, fmt.Errorf("SIWC token refresh failed after %d attempts: %w", maxRetries, lastErr)
 }

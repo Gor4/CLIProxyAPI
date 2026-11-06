@@ -38,6 +38,9 @@ const ErrorCodeStreamTruncated = "stream_truncated"
 
 const streamTruncatedErrorCode = ErrorCodeStreamTruncated
 
+// ErrorCodeRefreshOutcomeUnknown requires replacement or reconciliation of a refresh grant.
+const ErrorCodeRefreshOutcomeUnknown = "refresh_outcome_unknown"
+
 // ErrorCodeTransientRateLimit marks a transient per-model capacity or
 // admission 429 (for example a Codex turn_rate_limit_exceeded rejection).
 // The public status stays 429, but the credential quota is not exhausted:
