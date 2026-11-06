@@ -126,7 +126,14 @@ func MergeRefreshedAuth(base, current, updated *Auth) *Auth {
 		}
 		merged.Metadata["disabled"] = false
 
-		if hasNewConcurrentError {
+		if outcomeErr := codexRefreshAccessError(merged, time.Now()); outcomeErr != nil {
+			merged.Status = StatusError
+			merged.Unavailable = true
+			if !hasNewConcurrentError {
+				merged.LastError = sanitizeRenewalError(merged, outcomeErr)
+				merged.StatusMessage = merged.LastError.Message
+			}
+		} else if hasNewConcurrentError {
 			// A new error occurred concurrently (e.g. 503, 429, timeout). Preserve it.
 			merged.LastError = current.LastError
 			merged.Status = current.Status

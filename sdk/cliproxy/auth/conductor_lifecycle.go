@@ -436,7 +436,7 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 						auth.NextRefreshAfter = time.Time{}
 					}
 				}
-				canServeWithAccessToken := !auth.RequiresSignIn || auth.HasValidAccessToken(now)
+				canServeWithAccessToken := (!auth.RequiresSignIn || auth.HasValidAccessToken(now)) && codexRefreshAccessError(auth, now) == nil
 				isAuthOrGrantFailure := hasUnauthorizedAuthFailure(existing) ||
 					existing.RequiresSignIn ||
 					(existing.RefreshError != nil && isTerminalRefreshError(existing, existing.RefreshError)) ||

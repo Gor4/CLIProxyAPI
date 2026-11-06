@@ -685,6 +685,13 @@ func applyPreservedRenewalState(existing, updated *Auth, mode updateAuthMode, no
 			return
 		}
 		upstreamVerified := updated.CodexRefreshPatch == nil || updated.CodexRefreshPatch.UpstreamRefreshed()
+		var outcomeErr error
+		if strings.EqualFold(updated.Provider, "codex") {
+			outcomeErr = codexauth.RefreshOutcomeUnknown(updated.Metadata, false)
+			if outcomeErr == nil {
+				outcomeErr = codexauth.RefreshOutcomeUnknown(updated.Metadata, true)
+			}
+		}
 		if !upstreamVerified {
 			// Disk-only credential adoption during Refresh: treat as a newly loaded grant awaiting its first renewal.
 			updated.RequiresSignIn = false
@@ -699,6 +706,9 @@ func applyPreservedRenewalState(existing, updated *Auth, mode updateAuthMode, no
 			updated.LastInferenceVerifiedAt = time.Time{}
 			updated.RenewalVerified = false
 			updated.LastRenewalVerifiedAt = time.Time{}
+			if outcomeErr != nil {
+				updated.RefreshError = sanitizeRenewalError(updated, outcomeErr)
+			}
 			return
 		}
 		updated.RequiresSignIn = false
@@ -725,6 +735,11 @@ func applyPreservedRenewalState(existing, updated *Auth, mode updateAuthMode, no
 		}
 		updated.RenewalVerified = true
 		updated.LastRenewalVerifiedAt = now
+		if outcomeErr != nil {
+			updated.RefreshError = sanitizeRenewalError(updated, outcomeErr)
+			updated.RenewalVerified = false
+			updated.LastRenewalVerifiedAt = time.Time{}
+		}
 		return
 	}
 	if existing == nil {
@@ -1638,7 +1653,8 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 		}
 	}
 	applyPreservedRejectedTokens(base, updated, true)
-	canServeWithAccessToken := !updated.RequiresSignIn || updated.HasValidAccessToken(now)
+	outcomeAccessErr := codexRefreshAccessError(updated, now)
+	canServeWithAccessToken := (!updated.RequiresSignIn || updated.HasValidAccessToken(now)) && outcomeAccessErr == nil
 	if canServeWithAccessToken && (updated.RejectedAccessToken == "" || authAccessToken(updated) != updated.RejectedAccessToken) {
 		updated.LastError = nil
 		updated.StatusMessage = ""
@@ -1651,7 +1667,10 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	} else if !canServeWithAccessToken && !updated.Disabled && updated.Status != StatusDisabled {
 		updated.Unavailable = true
 		updated.Status = StatusError
-		if updated.StatusMessage == "" {
+		if outcomeAccessErr != nil {
+			updated.LastError = sanitizeRenewalError(updated, outcomeAccessErr)
+			updated.StatusMessage = updated.LastError.Message
+		} else if updated.StatusMessage == "" {
 			updated.StatusMessage = "unauthorized (refresh token invalid)"
 		}
 		if updated.LastError == nil && updated.RefreshError != nil {
